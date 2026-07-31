@@ -22,15 +22,17 @@ copy-on-write, avoiding the picklability constraint that blocks cloudpickle
 
 Returns arviz.InferenceData compatible with the EXOZIPPy pipeline.
 """
+
 import gc
 import logging
+import multiprocessing as mp
 import os
 import signal
+import threading
 import time
 
-import numpy as np
 import arviz as az
-import multiprocessing as mp
+import numpy as np
 import pytensor
 import pytensor.tensor as pt
 from pytensor.graph.replace import vectorize_graph
@@ -48,9 +50,14 @@ from pytensor.graph.replace import vectorize_graph
 # __init__.py first, before this module). This block is redundant there;
 # kept as a guard for any environment that imports ptde.py without ever
 # importing the exozippy package proper.
-for _tvar in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
-              "MKL_NUM_THREADS", "BLAS_NUM_THREADS",
-              "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+for _tvar in (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "BLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+):
     os.environ.setdefault(_tvar, "1")
 
 logger = logging.getLogger(__name__)
@@ -104,49 +111,34 @@ def _geometric_ladder(n_temps, T_max):
     return T_max ** (np.arange(n_temps) / (n_temps - 1))
 
 
-def _probe_scales(raw_start, logp_fn):
-    """Adaptive probe: find per-element proposal scales where one step costs ~0.5 nats.
-
-    Matches EXOFASTv2's exofast_getmcmcscale: bisects probe magnitude (both signs)
-    until Δlogp ≈ 0.5 (= Δχ²=1).  Falls back to 0.1 when no signal is found,
-    avoiding the old fixed-probe default of 1.0 that sent proposals outside tight
-    priors and caused ~1000 retries per chain.
-    """
-    map_lp = float(logp_fn(raw_start))
-    target_delta = 0.5   # nats; Δlogp=0.5 ↔ Δχ²=1 (EXOFASTv2 convention)
-
-    scales = {}
-    tight = []
-    for key, val in raw_start.items():
-        n = val.size
-        s = np.full(n, 0.1)   # conservative fallback (old default 1.0 → many retries)
-        for i in range(n):
-            found = False
-            for probe_mag in [0.003, 0.01, 0.03, 0.1, 0.3, 1.0, 2.0]:
-                if found:
-                    break
-                for sign in (1.0, -1.0):
-                    dp = sign * probe_mag
-                    probe = {k: v.copy() for k, v in raw_start.items()}
-                    probe[key] = probe[key].copy()
-                    probe[key].flat[i] += dp
-                    plp = float(logp_fn(probe))
-                    delta = map_lp - plp
-                    if delta > 0 and np.isfinite(delta):
-                        # Quadratic approx: scale² × (delta/dp²) = target_delta
-                        s.flat[i] = min(1.0, abs(dp) * np.sqrt(target_delta / delta))
-                        found = True
-                        break
-            if s.flat[i] < 0.5:
-                tight.append(f"{key}[{i}]: scale={s.flat[i]:.3g}")
-        scales[key] = s.reshape(val.shape)
-
-    if tight:
-        logger.info("PTDE probe: tightly-constrained params: " + "; ".join(tight))
-    return map_lp, scales
+# The chain-initialization probe lives in exozippy.whitening now (it is also
+# the engine behind the data-driven whitening rescale done at model setup);
+# PTDE re-probes the already-whitened model, where every scale is ~1, so the
+# default (narrow) dynamic range is the right one here.  The old private
+# names are re-exported for compatibility.
+from exozippy.whitening import (
+    _PROBE_FLAT_SCALE,
+)
+from exozippy.whitening import (  # noqa: E402
+    PROBE_TARGET_DELTA as _PROBE_TARGET_DELTA,
+)
+from exozippy.whitening import (
+    probe_scales as _probe_scales,
+)
+from exozippy.whitening import (
+    probe_step_1d as _probe_step_1d,
+)
 
 
-def _make_starts(n_chains, raw_starts, logp_fn, rng, seed_indices=None):
+def _make_starts(
+    n_chains,
+    raw_starts,
+    logp_fn,
+    rng,
+    seed_indices=None,
+    system=None,
+    raw_scales=None,
+):
     """Generate n_chains starting points near one or more seeds (P4).
 
     `raw_starts` is a single raw-start dict (legacy) or a LIST of K raw-start
@@ -160,6 +152,22 @@ def _make_starts(n_chains, raw_starts, logp_fn, rng, seed_indices=None):
     boundaries (lp=-inf).  Raises RuntimeError if a chain cannot be initialized
     within max_iter retries.
 
+    The scatter is delegated to `system.jitter_raw_start` when the system
+    provides it, which draws in physical space from a Gaussian truncated to
+    each parameter's bounds.  Scattering in raw space instead saturates the
+    logit transform and starts a large fraction of chains pinned at the bounds
+    (31.5% within 1% of a bound for a parameter whose logp is flat out to them,
+    against uniform's 2.0%); see System.jitter_raw_start.  Systems without that
+    method (minimal test stubs) fall back to the historical raw-space jitter.
+
+    ``raw_scales`` (optional) is the per-element dispersion scale in current
+    raw units, as measured by the startup whitening pass (run.py passes
+    whiten_report["raw_scales"]).  When given, the probe is skipped entirely
+    -- the model was just whitened against the very same start, so re-probing
+    would re-derive ~1.0 everywhere at n_elements x O(10) logp calls.  When
+    absent (measure_scales: false, or standalone use), the probe runs as
+    before.
+
     Returns (starts, chain_seed_index) where chain_seed_index[j] is the original
     seed index that chain j was drawn from (for trace-attr provenance).
     """
@@ -169,15 +177,35 @@ def _make_starts(n_chains, raw_starts, logp_fn, rng, seed_indices=None):
     if seed_indices is None:
         seed_indices = list(range(K))
 
-    # Probe scales once from seed 0 (the canonical MAP-ish start); the same
-    # per-parameter jitter scale is reused around every seed.
-    map_lp, scales = _probe_scales(raw_starts[0], logp_fn)
+    if raw_scales is not None:
+        map_lp = float(logp_fn(raw_starts[0]))
+        scales = {
+            k: np.asarray(
+                raw_scales.get(k, np.ones_like(np.asarray(v, dtype=float))),
+                dtype=float,
+            ).reshape(np.shape(v))
+            for k, v in raw_starts[0].items()
+        }
+    else:
+        # Probe scales once from seed 0 (the canonical MAP-ish start); the same
+        # per-parameter jitter scale is reused around every seed.
+        map_lp, scales = _probe_scales(raw_starts[0], logp_fn)
     n_params = sum(v.size for v in raw_starts[0].values())
     factor = min(np.sqrt(500.0 / max(n_params, 1)), 3.0)
     max_iter = 1000
+    _jitter = (
+        getattr(system, "jitter_raw_start", None)
+        if system is not None
+        else None
+    )
     logger.info(
-        f"PTDE init: MAP lp={map_lp:.1f}, n_params={n_params}, factor={factor:.2f}"
-        + (f", {K} seeds (round-robin over {n_chains} chains)" if K > 1 else "")
+        f"PTDE init: MAP lp={map_lp:.1f}, n_params={n_params}, factor={factor:.2f}, "
+        f"jitter={'physical (truncated)' if _jitter else 'raw (fallback)'}"
+        + (
+            f", {K} seeds (round-robin over {n_chains} chains)"
+            if K > 1
+            else ""
+        )
     )
 
     starts = []
@@ -193,16 +221,24 @@ def _make_starts(n_chains, raw_starts, logp_fn, rng, seed_indices=None):
                 starts.append({k: v.copy() for k, v in center.items()})
                 chain_seed_index.append(seed_indices[s])
                 seed_seen.add(s)
-                logger.debug(f"PTDE init chain {j}: exact seed {seed_indices[s]} "
-                             f"(lp={lp0:.1f})")
+                logger.debug(
+                    f"PTDE init chain {j}: exact seed {seed_indices[s]} "
+                    f"(lp={lp0:.1f})"
+                )
                 continue
             logger.warning(
                 f"PTDE init: seed {seed_indices[s]} exact start has non-finite "
-                f"lp; jittering to find a finite start.")
+                f"lp; jittering to find a finite start."
+            )
         for niter in range(max_iter):
             eff = factor / np.exp(niter / 1000.0)
-            prop = {k: v + eff * scales[k] * rng.standard_normal(v.shape)
-                    for k, v in center.items()}
+            if _jitter is not None:
+                prop = _jitter(center, scales, eff, rng)
+            else:
+                prop = {
+                    k: v + eff * scales[k] * rng.standard_normal(v.shape)
+                    for k, v in center.items()
+                }
             lp = float(logp_fn(prop))
             if np.isfinite(lp):
                 starts.append(prop)
@@ -221,7 +257,7 @@ def _make_starts(n_chains, raw_starts, logp_fn, rng, seed_indices=None):
         else:
             raise RuntimeError(
                 f"PTDE chain {j} initialization failed after {max_iter} retries. "
-                f"Check init_scale values in your params.yaml -- a parameter may be "
+                f"Check initval/bounds in your params.yaml -- a parameter may be "
                 f"starting outside its prior bounds."
             )
     return starts, chain_seed_index
@@ -234,6 +270,48 @@ def _worker_init():
     (BrokenProcessPool) instead of letting it finish and wrap up cleanly."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+
+def _shutdown_pool(pool, grace=1.0):
+    """terminate() a Pool, escalating to SIGKILL for workers that outlive the
+    grace period.
+
+    _worker_init has the workers ignore SIGTERM (so a batch scheduler signalling
+    the whole process group cannot break the parent mid-step). But pool.terminate()
+    kills workers *by sending SIGTERM*, then joins them -- so a worker stuck in a
+    pathological logp evaluation ignores the terminate and the join blocks forever.
+    That is the "recycling worker pool" hang: a timed-out worker is exactly the
+    one that can never be reaped this way.
+
+    The SIGKILL is issued from a watchdog thread rather than up front, because it
+    must land only AFTER terminate() is past its _help_stuff_finish step. That
+    step drains inqueue while holding inqueue._rlock; a worker blocked in
+    inqueue.get() holds that same lock, so SIGKILLing it before terminate()
+    reaches _help_stuff_finish wedges the lock and deadlocks terminate() even
+    earlier. Waiting `grace` seconds lets a well-behaved terminate() finish
+    untouched (the escalation never fires), and only forces the issue when a
+    worker is genuinely wedged.
+    """
+    done = threading.Event()
+
+    def _reaper():
+        if done.wait(grace):
+            return  # terminate()/join() completed cleanly; no escalation needed
+        for p in pool._pool:
+            if p.exitcode is None:
+                try:
+                    os.kill(p.pid, signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    pass
+
+    watchdog = threading.Thread(target=_reaper, daemon=True)
+    watchdog.start()
+    try:
+        pool.terminate()
+        pool.join()
+    finally:
+        done.set()
+        watchdog.join()
 
 
 def _map_logp(pool, proposals):
@@ -304,6 +382,7 @@ def _pick_two(rng, n, exclude):
 # excursions that transport a chain out of one posterior mode and into
 # another) scale O(n_temps) instead of the O(n_temps^2) of random-pair swaps.
 # ---------------------------------------------------------------------------
+
 
 def _deo_pairs(round_idx, n_temps, active_rungs=None):
     """Adjacent rung pairs attempted simultaneously in one DEO swap round.
@@ -414,8 +493,8 @@ def _update_ladder_barrier(temperatures, swap_accept, swap_propose):
     beta = 1.0 / np.asarray(temperatures, dtype=float)
     targets = np.linspace(0.0, Lambda[-1], n_temps)
     new_beta = np.interp(targets, Lambda, beta)
-    new_beta[0] = beta[0]      # pin target rung (T=1)
-    new_beta[-1] = beta[-1]    # pin hottest rung (T=T_max)
+    new_beta[0] = beta[0]  # pin target rung (T=1)
+    new_beta[-1] = beta[-1]  # pin hottest rung (T=T_max)
     return 1.0 / new_beta
 
 
@@ -439,8 +518,9 @@ def _active_rungs(step, n_temps, thin_start, thin_factor):
     """
     if thin_factor <= 1:
         return list(range(n_temps))
-    return [k for k in range(n_temps)
-            if k < thin_start or step % thin_factor == 0]
+    return [
+        k for k in range(n_temps) if k < thin_start or step % thin_factor == 0
+    ]
 
 
 def _convergence_check_schedule(min_draws=100, growth=0.9):
@@ -452,11 +532,29 @@ def _convergence_check_schedule(min_draws=100, growth=0.9):
     """
     j, prev = 0, 0
     while True:
-        n = round(min_draws / growth ** j)
+        n = round(min_draws / growth**j)
         if n > prev:
             yield n
             prev = n
         j += 1
+
+
+def _safe_progress(progress_callback, state):
+    """Invoke an optional GUI progress hook without ever letting it break the run.
+
+    The callback (see exozippy.gui.status.GuiReporter.progress_callback) writes
+    monitoring artifacts to disk; a filesystem hiccup there must never abort
+    sampling, so any exception is logged and swallowed.
+    """
+    if progress_callback is None:
+        return
+    try:
+        progress_callback(state)
+    except Exception:
+        logger.warning(
+            "PTDE: progress_callback raised; continuing sampling",
+            exc_info=True,
+        )
 
 
 def _check_convergence(stored_raw, n_draws, min_ess, max_rhat, stored_lp=None):
@@ -477,8 +575,7 @@ def _check_convergence(stored_raw, n_draws, min_ess, max_rhat, stored_lp=None):
     posterior = {key: arr[:, :n_draws] for key, arr in stored_raw.items()}
     lp = stored_lp[:, :n_draws] if stored_lp is not None else None
     try:
-        return convergence.converged_on_tail(
-            posterior, lp, min_ess, max_rhat)
+        return convergence.converged_on_tail(posterior, lp, min_ess, max_rhat)
     except Exception:
         return False, float("nan"), float("nan")
 
@@ -496,6 +593,7 @@ def ptde_sample(
     initvals=None,
     raw_starts=None,
     seed_indices=None,
+    raw_scales=None,
     gamma=None,
     target_accept=0.20,
     adapt_gamma=True,
@@ -514,6 +612,7 @@ def ptde_sample(
     maxtime=None,
     eval_timeout=None,
     lp_plausibility_ceiling=None,
+    progress_callback=None,
 ):
     """
     Parallel Tempering + Differential Evolution sampler.
@@ -592,6 +691,13 @@ def ptde_sample(
                term), not physics. None -> outputs.modes.DEFAULT_LP_ABS_MAX
                (the same constant identify_modes uses to reject runaway
                draws post-hoc).
+    progress_callback : callable | None  — optional GUI progress hook invoked
+               at each geometric convergence check (bounded overhead) with a
+               state dict {n_draws, n_chains, max_rhat, min_ess, elapsed_s,
+               stop_reason?} plus, for snapshot writers, stored_raw/stored_lp/
+               raw_var_names referencing the live T=1 draw buffers. Exceptions
+               raised by the callback are logged and swallowed (see
+               _safe_progress), so a monitoring failure never aborts the fit.
 
     Returns
     -------
@@ -605,19 +711,22 @@ def ptde_sample(
 
     if swap_schedule not in ("deo", "random"):
         raise ValueError(
-            f"swap_schedule must be 'deo' or 'random', got {swap_schedule!r}")
+            f"swap_schedule must be 'deo' or 'random', got {swap_schedule!r}"
+        )
 
     rng = np.random.default_rng(seed)
     temperatures = _geometric_ladder(n_temps, T_max)
 
     _rung_thin_factor = max(1, int(rung_thin_factor))
-    _rung_thin_start = (n_temps // 2 if rung_thin_start is None
-                        else int(rung_thin_start))
+    _rung_thin_start = (
+        n_temps // 2 if rung_thin_start is None else int(rung_thin_start)
+    )
     _rung_thin_start = max(1, min(_rung_thin_start, n_temps))  # never thin T=1
     if _rung_thin_factor > 1 and _rung_thin_start < n_temps:
         logger.info(
             f"PTDE: rung thinning enabled — rungs >= {_rung_thin_start} "
-            f"(of {n_temps}) propose every {_rung_thin_factor} steps")
+            f"(of {n_temps}) propose every {_rung_thin_factor} steps"
+        )
 
     # compile logp ONCE; store in module global BEFORE forking workers
     logp_fn = model.compile_logp()
@@ -645,28 +754,34 @@ def ptde_sample(
         on_unused_input="ignore",
     )
     _batched_inputs = [
-        pt.tensor(name=f"batched_{v.name}", dtype=v.type.dtype,
-                  shape=(None,) + v.type.shape)
+        pt.tensor(
+            name=f"batched_{v.name}",
+            dtype=v.type.dtype,
+            shape=(None,) + v.type.shape,
+        )
         for v in model.free_RVs
     ]
     raw_to_phys_batched = pytensor.function(
         inputs=_batched_inputs,
-        outputs=vectorize_graph(output_vars,
-                                 replace=dict(zip(model.free_RVs, _batched_inputs))),
+        outputs=vectorize_graph(
+            output_vars, replace=dict(zip(model.free_RVs, _batched_inputs))
+        ),
         on_unused_input="ignore",
     )
-    raw_var_names = [v.name for v in model.free_RVs]   # ordered input names
-    out_var_names = [v.name for v in output_vars]       # ordered output names
+    raw_var_names = [v.name for v in model.free_RVs]  # ordered input names
+    out_var_names = [v.name for v in output_vars]  # ordered output names
 
     # parameter bookkeeping
     raw_start = system.get_raw_start(model)
     model_keys = list(raw_start.keys())
     n_params = sum(v.size for v in raw_start.values())
     if n_chains is None:
-        n_chains = 2 * n_params   # standard DE minimum for good mixing
+        n_chains = 2 * n_params  # standard DE minimum for good mixing
     if gamma is None:
         gamma = 2.38 / np.sqrt(2 * n_params)
-    logger.info(f"PTDE: {n_params} params, {n_chains} chains/rung, γ={gamma:.4f}")
+    logger.info(
+        f"PTDE: {n_params} params, {n_chains} chains/rung, γ={gamma:.4f}"
+    )
 
     # initialize populations
     if initvals is not None:
@@ -685,25 +800,44 @@ def ptde_sample(
             else:
                 raw_starts, seed_indices = [raw_start], [0]
         t1_starts, chain_seed_index = _make_starts(
-            n_chains, raw_starts, logp_fn, rng, seed_indices)
+            n_chains,
+            raw_starts,
+            logp_fn,
+            rng,
+            seed_indices,
+            system=system,
+            raw_scales=raw_scales,
+        )
 
     # ensemble start plots (T=1 starts only; raw→physical via the batched fn)
     if plot_prefix is not None:
         logger.info("Generating ensemble start plots...")
         batched_vals = raw_to_phys_batched(
-            *[np.stack([s[k] for s in t1_starts], axis=0) for k in raw_var_names])
+            *[
+                np.stack([s[k] for s in t1_starts], axis=0)
+                for k in raw_var_names
+            ]
+        )
         internal_starts = [
-            {name: np.asarray(val)[i] for name, val in zip(out_var_names, batched_vals)}
+            {
+                name: np.asarray(val)[i]
+                for name, val in zip(out_var_names, batched_vals)
+            }
             for i in range(len(t1_starts))
         ]
         for comp in system.active_components.values():
-            comp.plot(system, internal_starts,
-                      filename_prefix=plot_prefix + "_start_ensemble")
+            comp.plot(
+                system,
+                internal_starts,
+                filename_prefix=plot_prefix + "_start_ensemble",
+            )
 
     # Replicate T=1 starts to all rungs; hotter chains spread quickly during tune
     populations = [
-        [{k: v.copy() for k, v in t1_starts[i % n_chains].items()}
-         for i in range(n_chains)]
+        [
+            {k: v.copy() for k, v in t1_starts[i % n_chains].items()}
+            for i in range(n_chains)
+        ]
         for _ in range(n_temps)
     ]
 
@@ -717,26 +851,34 @@ def ptde_sample(
     if cores > phys_cores:
         logger.warning(
             f"PTDE: cores={cores} exceeds physical core count ({phys_cores}); "
-            f"over-subscription will slow sampling via context switching.")
+            f"over-subscription will slow sampling via context switching."
+        )
     logger.info(
         f"PTDE: {n_temps} rungs × {n_chains} chains = {total_proposals} proposals/step, "
         f"{actual_cores} cores  "
-        f"T=[{', '.join(f'{t:.1f}' for t in temperatures)}]")
-    pool = (mp.get_context("fork").Pool(actual_cores, initializer=_worker_init)
-            if actual_cores > 1 else None)
+        f"T=[{', '.join(f'{t:.1f}' for t in temperatures)}]"
+    )
+    pool = (
+        mp.get_context("fork").Pool(actual_cores, initializer=_worker_init)
+        if actual_cores > 1
+        else None
+    )
 
     if eval_timeout is not None and pool is None:
         logger.warning(
             f"PTDE: eval_timeout={eval_timeout:.0f}s has no effect with a single "
             f"core (cores={actual_cores}) — there is no worker process to enforce "
-            f"a wall-clock timeout against a hung logp call.")
+            f"a wall-clock timeout against a hung logp call."
+        )
 
     # Early-stop state: mutable list so the closure can write back to us.
     stop_requested = [False]
     actual_draws = 0
     start_time = time.time()
     n_eval_timeouts = [0]  # mutable box, incremented by _eval_logps_safe
-    rung_times = [[] for _ in range(n_temps)]  # per-rung wall times (collect_rung_timing only)
+    rung_times = [
+        [] for _ in range(n_temps)
+    ]  # per-rung wall times (collect_rung_timing only)
 
     def _eval_logps_safe(proposals, step_label, index_labels=None, rungs=None):
         """Evaluate logps for `proposals`, honoring eval_timeout if set.
@@ -773,23 +915,32 @@ def ptde_sample(
             for idx in timed_out:
                 raw_vals = [proposals[idx][k] for k in raw_var_names]
                 phys_vals = raw_to_phys(*raw_vals)
-                phys_params = {name: np.asarray(val).tolist()
-                               for name, val in zip(out_var_names, phys_vals)}
-                raw_params = {k: np.asarray(v).tolist()
-                              for k, v in proposals[idx].items()}
-                who = index_labels[idx] if index_labels is not None else f"proposal {idx}"
+                phys_params = {
+                    name: np.asarray(val).tolist()
+                    for name, val in zip(out_var_names, phys_vals)
+                }
+                raw_params = {
+                    k: np.asarray(v).tolist()
+                    for k, v in proposals[idx].items()
+                }
+                who = (
+                    index_labels[idx]
+                    if index_labels is not None
+                    else f"proposal {idx}"
+                )
                 logger.error(
                     f"PTDE: logp call exceeded eval_timeout={eval_timeout:.0f}s "
                     f"at {step_label} ({who}) — rejecting this proposal.\n"
                     f"  physical params: {phys_params}\n"
-                    f"  raw params: {raw_params}")
+                    f"  raw params: {raw_params}"
+                )
             if pool is not None:
                 logger.warning(
                     f"PTDE: recycling worker pool after {len(timed_out)} "
                     f"timeout(s) at {step_label} — a hung worker never "
-                    f"rejoins the pool on its own.")
-                pool.terminate()
-                pool.join()
+                    f"rejoins the pool on its own."
+                )
+                _shutdown_pool(pool)
                 # Terminated Pools sit in reference cycles (handler threads,
                 # worker sentinels, queue pipes) that only the cyclic GC
                 # frees; without an explicit collect each recycle leaks
@@ -798,7 +949,8 @@ def ptde_sample(
                 pool = None
                 gc.collect()
                 pool = mp.get_context("fork").Pool(
-                    actual_cores, initializer=_worker_init)
+                    actual_cores, initializer=_worker_init
+                )
         if _PTDE_COLLECT_TIMING:
             if rungs is not None:
                 for r, k in zip(lps, rungs):
@@ -806,17 +958,20 @@ def ptde_sample(
             return [r[0] for r in lps]
         return lps
 
-    _do_convergence = (min_ess is not None or max_rhat is not None) and n_chains >= 2
+    _do_convergence = (
+        min_ess is not None or max_rhat is not None
+    ) and n_chains >= 2
     _check_gen = _convergence_check_schedule() if _do_convergence else None
     _next_check = [next(_check_gen)] if _check_gen else [None]
 
     def _stop_handler(sig, frame):
         if stop_requested[0]:
-            raise KeyboardInterrupt   # second signal: abort immediately
+            raise KeyboardInterrupt  # second signal: abort immediately
         stop_requested[0] = True
         logger.info(
             f"PTDE: stop requested ({signal.Signals(sig).name}) — finishing "
-            "current step (send the signal again to abort immediately)")
+            "current step (send the signal again to abort immediately)"
+        )
 
     # SIGTERM gets the same handler as SIGINT so a batch scheduler (e.g.
     # `qsig -s SIGTERM <job_id>` / `kill -TERM <pid>`) can request the same
@@ -825,27 +980,45 @@ def ptde_sample(
     # discarding whatever draws were already collected).
     old_sigint = signal.signal(signal.SIGINT, _stop_handler)
     old_sigterm = signal.signal(signal.SIGTERM, _stop_handler)
+    # Windows delivers the GUI's stop request as CTRL_BREAK_EVENT, which
+    # arrives here as SIGBREAK rather than SIGINT (see gui/runner.py).
+    # Without this the request is received and silently ignored.
+    old_sigbreak = (
+        signal.signal(signal.SIGBREAK, _stop_handler)
+        if hasattr(signal, "SIGBREAK")
+        else None
+    )
     try:
         # initial logp evaluations
-        flat_starts = [populations[k][i]
-                       for k in range(n_temps) for i in range(n_chains)]
-        flat_start_labels = [f"rung {k} chain {i}"
-                              for k in range(n_temps) for i in range(n_chains)]
+        flat_starts = [
+            populations[k][i] for k in range(n_temps) for i in range(n_chains)
+        ]
+        flat_start_labels = [
+            f"rung {k} chain {i}"
+            for k in range(n_temps)
+            for i in range(n_chains)
+        ]
         flat_start_rungs = [k for k in range(n_temps) for i in range(n_chains)]
-        all_lps = _eval_logps_safe(flat_starts, "initial evaluation",
-                                    index_labels=flat_start_labels,
-                                    rungs=flat_start_rungs)
+        all_lps = _eval_logps_safe(
+            flat_starts,
+            "initial evaluation",
+            index_labels=flat_start_labels,
+            rungs=flat_start_rungs,
+        )
         logps = [
             [all_lps[k * n_chains + i] for i in range(n_chains)]
             for k in range(n_temps)
         ]
         logger.info(
             f"PTDE: T=1 initial lp  "
-            f"min={min(logps[0]):.1f}  max={max(logps[0]):.1f}")
+            f"min={min(logps[0]):.1f}  max={max(logps[0]):.1f}"
+        )
 
         # storage: raw values from T=1 chains only
-        stored_raw = {k: np.zeros((n_chains, draws) + raw_start[k].shape)
-                      for k in model_keys}
+        stored_raw = {
+            k: np.zeros((n_chains, draws) + raw_start[k].shape)
+            for k in model_keys
+        }
         stored_lp = np.zeros((n_chains, draws))
 
         n_accept = np.zeros(n_temps)
@@ -873,13 +1046,17 @@ def ptde_sample(
             #    (rung thinning skips hot rungs on most steps; see _active_rungs)
             props_flat = []
             prop_map = []
-            for k in _active_rungs(step, n_temps, _rung_thin_start, _rung_thin_factor):
+            for k in _active_rungs(
+                step, n_temps, _rung_thin_start, _rung_thin_factor
+            ):
                 pop_k = populations[k]
                 for i in range(n_chains):
                     j1, j2 = _pick_two(rng, n_chains, i)
-                    prop = {key: pop_k[i][key]
-                                 + gamma * (pop_k[j1][key] - pop_k[j2][key])
-                            for key in model_keys}
+                    prop = {
+                        key: pop_k[i][key]
+                        + gamma * (pop_k[j1][key] - pop_k[j2][key])
+                        for key in model_keys
+                    }
                     props_flat.append(prop)
                     prop_map.append((k, i))
             _t_build = time.time()
@@ -887,9 +1064,11 @@ def ptde_sample(
             # 2. evaluate all logps in parallel
             prop_labels = [f"rung {k} chain {i}" for k, i in prop_map]
             prop_lps = _eval_logps_safe(
-                props_flat, f"step {step + 1} ({phase})",
+                props_flat,
+                f"step {step + 1} ({phase})",
                 index_labels=prop_labels,
-                rungs=[k for k, i in prop_map])
+                rungs=[k for k, i in prop_map],
+            )
             _t_eval = time.time()
 
             # 3. Metropolis accept/reject at effective temperature T_k
@@ -897,9 +1076,9 @@ def ptde_sample(
                 T = temperatures[k]
                 lp_new = prop_lps[idx]
                 n_propose[k] += 1
-                if (np.isfinite(lp_new)
-                        and rng.random()
-                            < np.exp(min(0.0, (lp_new - logps[k][i]) / T))):
+                if np.isfinite(lp_new) and rng.random() < np.exp(
+                    min(0.0, (lp_new - logps[k][i]) / T)
+                ):
                     populations[k][i] = props_flat[idx]
                     logps[k][i] = lp_new
                     n_accept[k] += 1
@@ -912,8 +1091,11 @@ def ptde_sample(
                     # examples/DC2018_128, a real occurrence of exactly this
                     # failure mode). Warn once so it's noticed immediately
                     # rather than discovered post-hoc via identify_modes.
-                    if (k == 0 and not warned_implausible_lp
-                            and abs(lp_new) > lp_plausibility_ceiling):
+                    if (
+                        k == 0
+                        and not warned_implausible_lp
+                        and abs(lp_new) > lp_plausibility_ceiling
+                    ):
                         logger.warning(
                             f"PTDE: T=1 chain {i} lp={lp_new:.3e} exceeds "
                             f"the plausibility ceiling "
@@ -923,7 +1105,8 @@ def ptde_sample(
                             "PTDE only accepts lp increases, this chain "
                             "will likely keep climbing for the rest of the "
                             "run. See outputs.modes.identify_modes, which "
-                            "rejects draws on the same ceiling post-hoc.")
+                            "rejects draws on the same ceiling post-hoc."
+                        )
                         warned_implausible_lp = True
 
             # 4. temperature swaps. DEO (deterministic even-odd) schedule by
@@ -934,35 +1117,44 @@ def ptde_sample(
             if n_temps > 1 and (step + 1) % swap_interval == 0:
                 if swap_schedule == "deo":
                     active = _active_rungs(
-                        step, n_temps, _rung_thin_start, _rung_thin_factor)
+                        step, n_temps, _rung_thin_start, _rung_thin_factor
+                    )
                     deo_pairs = _deo_pairs(swap_round, n_temps, active)
                     if _rung_thin_factor > 1 and len(deo_pairs) < len(
-                            _deo_pairs(swap_round, n_temps)):
+                        _deo_pairs(swap_round, n_temps)
+                    ):
                         logger.debug(
                             "PTDE DEO: some swap pairs skipped this round "
-                            "(rung thinned inactive)")
+                            "(rung thinned inactive)"
+                        )
                     # Fresh random chain pairing each round: rung-k chain i is
                     # swapped with rung-(k+1) chain perm[i]. Any fixed or
                     # randomized pairing is valid (each pairwise swap satisfies
                     # detailed balance at fixed pairing); a random permutation
                     # spreads swap attempts symmetrically over all n_chains.
                     perm = rng.permutation(n_chains)
-                    for (k, kp1) in deo_pairs:
+                    for k, kp1 in deo_pairs:
                         for i in range(n_chains):
                             j = int(perm[i])
                             n_swap_propose[k] += 1
                             # (logp_j - logp_i) * (1/T_k - 1/T_{k+1});
                             # T_k < T_{k+1} -> factor > 0 -> accept lp increase.
-                            log_a = ((logps[kp1][j] - logps[k][i])
-                                     * (1.0 / temperatures[k]
-                                        - 1.0 / temperatures[kp1]))
+                            log_a = (logps[kp1][j] - logps[k][i]) * (
+                                1.0 / temperatures[k] - 1.0 / temperatures[kp1]
+                            )
                             if rng.random() < np.exp(min(0.0, log_a)):
-                                (populations[k][i], populations[kp1][j]) = (
-                                    populations[kp1][j], populations[k][i])
-                                (logps[k][i], logps[kp1][j]) = (
-                                    logps[kp1][j], logps[k][i])
-                                (direction[k][i], direction[kp1][j]) = (
-                                    direction[kp1][j], direction[k][i])
+                                populations[k][i], populations[kp1][j] = (
+                                    populations[kp1][j],
+                                    populations[k][i],
+                                )
+                                logps[k][i], logps[kp1][j] = (
+                                    logps[kp1][j],
+                                    logps[k][i],
+                                )
+                                direction[k][i], direction[kp1][j] = (
+                                    direction[kp1][j],
+                                    direction[k][i],
+                                )
                                 n_swap_accept[k] += 1
                     swap_round += 1
                 else:
@@ -974,16 +1166,22 @@ def ptde_sample(
                         i = int(rng.integers(n_chains))
                         j = int(rng.integers(n_chains))
                         n_swap_propose[k] += 1
-                        log_a = ((logps[k+1][j] - logps[k][i])
-                                 * (1.0 / temperatures[k]
-                                    - 1.0 / temperatures[k + 1]))
+                        log_a = (logps[k + 1][j] - logps[k][i]) * (
+                            1.0 / temperatures[k] - 1.0 / temperatures[k + 1]
+                        )
                         if rng.random() < np.exp(min(0.0, log_a)):
-                            (populations[k][i], populations[k+1][j]) = (
-                                populations[k+1][j], populations[k][i])
-                            (logps[k][i], logps[k+1][j]) = (
-                                logps[k+1][j], logps[k][i])
-                            (direction[k][i], direction[k+1][j]) = (
-                                direction[k+1][j], direction[k][i])
+                            populations[k][i], populations[k + 1][j] = (
+                                populations[k + 1][j],
+                                populations[k][i],
+                            )
+                            logps[k][i], logps[k + 1][j] = (
+                                logps[k + 1][j],
+                                logps[k][i],
+                            )
+                            direction[k][i], direction[k + 1][j] = (
+                                direction[k + 1][j],
+                                direction[k][i],
+                            )
                             n_swap_accept[k] += 1
                 _record_round_trips(direction, round_trips, n_temps)
                 n_swap_rounds += 1
@@ -991,13 +1189,14 @@ def ptde_sample(
             _t_step = time.time()
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
-                    f"PTDE step {step+1} ({phase})  "
+                    f"PTDE step {step + 1} ({phase})  "
                     f"n_props={len(props_flat)}  "
-                    f"total={_t_step-_t0:.3f}s  "
-                    f"build={_t_build-_t0:.3f}s  "
-                    f"eval={_t_eval-_t_build:.3f}s  "
-                    f"rest={_t_step-_t_eval:.3f}s  "
-                    f"T1_lp=[{min(logps[0]):.1f},{max(logps[0]):.1f}]")
+                    f"total={_t_step - _t0:.3f}s  "
+                    f"build={_t_build - _t0:.3f}s  "
+                    f"eval={_t_eval - _t_build:.3f}s  "
+                    f"rest={_t_step - _t_eval:.3f}s  "
+                    f"T1_lp=[{min(logps[0]):.1f},{max(logps[0]):.1f}]"
+                )
 
             # 5. store T=1 draws
             if phase == "draw":
@@ -1019,11 +1218,14 @@ def ptde_sample(
                     ar_T1 = ar[0]
                     if ar_T1 > 0:
                         scale = (ar_T1 / target_accept) ** 0.5
-                        gamma_new = float(np.clip(gamma * scale,
-                                                   gamma * 0.1, gamma * 10.0))
+                        gamma_new = float(
+                            np.clip(gamma * scale, gamma * 0.1, gamma * 10.0)
+                        )
                         if abs(gamma_new - gamma) / gamma > 0.01:
-                            logger.info(f"PTDE gamma: {gamma:.4f} → {gamma_new:.4f} "
-                                        f"(T=1 accept={ar_T1:.3f}, target={target_accept:.2f})")
+                            logger.info(
+                                f"PTDE gamma: {gamma:.4f} → {gamma_new:.4f} "
+                                f"(T=1 accept={ar_T1:.3f}, target={target_accept:.2f})"
+                            )
                             gamma = gamma_new
 
                 # Communication-barrier ladder adaptation (Syed et al. 2022),
@@ -1031,14 +1233,20 @@ def ptde_sample(
                 # re-spacing after tuning would break invariance. Uses this
                 # window's swap accept/propose counts, so it must run before
                 # the reset below. Independent of adapt_gamma.
-                if (phase == "tune" and adapt_ladder and n_temps > 2
-                        and n_swap_propose.sum() > 0):
+                if (
+                    phase == "tune"
+                    and adapt_ladder
+                    and n_temps > 2
+                    and n_swap_propose.sum() > 0
+                ):
                     new_T = _update_ladder_barrier(
-                        temperatures, n_swap_accept, n_swap_propose)
+                        temperatures, n_swap_accept, n_swap_propose
+                    )
                     if not np.allclose(new_T, temperatures):
                         logger.info(
                             "PTDE ladder (barrier-equalized): "
-                            f"T=[{', '.join(f'{t:.1f}' for t in new_T)}]")
+                            f"T=[{', '.join(f'{t:.1f}' for t in new_T)}]"
+                        )
                         temperatures = new_T
 
                 # Reset window counters during tune so each adaptation period
@@ -1051,39 +1259,71 @@ def ptde_sample(
 
                 rt_rate = round_trips[0] / max(n_swap_rounds, 1)
                 logger.info(
-                    f"PTDE {step+1}/{total_steps} ({phase})  "
+                    f"PTDE {step + 1}/{total_steps} ({phase})  "
                     f"accept=[{', '.join(f'{r:.2f}' for r in ar)}]  "
                     f"γ={gamma:.4f}  "
-                    + (f"swap=[{', '.join(f'{r:.2f}' for r in sr)}]  "
-                       f"round_trips={round_trips[0]} "
-                       f"(rate={rt_rate:.3f}/round)"
-                       if n_temps > 1 else ""))
+                    + (
+                        f"swap=[{', '.join(f'{r:.2f}' for r in sr)}]  "
+                        f"round_trips={round_trips[0]} "
+                        f"(rate={rt_rate:.3f}/round)"
+                        if n_temps > 1
+                        else ""
+                    )
+                )
 
             # 7. early-stop checks
             if stop_requested[0]:
                 if actual_draws == 0:
-                    logger.warning("PTDE: stop requested during tune — no draws to save")
+                    logger.warning(
+                        "PTDE: stop requested during tune — no draws to save"
+                    )
                     raise KeyboardInterrupt
-                logger.info(f"PTDE: stopping after {actual_draws} draws (user interrupt)")
+                logger.info(
+                    f"PTDE: stopping after {actual_draws} draws (user interrupt)"
+                )
                 break
 
             if maxtime is not None and (time.time() - start_time) > maxtime:
                 if actual_draws == 0:
-                    logger.warning(f"PTDE: time limit {maxtime:.0f}s reached during tune — no draws to save")
+                    logger.warning(
+                        f"PTDE: time limit {maxtime:.0f}s reached during tune — no draws to save"
+                    )
                     raise KeyboardInterrupt
                 logger.info(
                     f"PTDE: wall-clock limit {maxtime:.0f}s reached "
-                    f"after {actual_draws} draws")
+                    f"after {actual_draws} draws"
+                )
                 break
 
-            if (phase == "draw"
-                    and _next_check[0] is not None
-                    and actual_draws >= _next_check[0]):
+            if (
+                phase == "draw"
+                and _next_check[0] is not None
+                and actual_draws >= _next_check[0]
+            ):
                 converged, rhat_val, ess_val = _check_convergence(
-                    stored_raw, actual_draws, min_ess, max_rhat, stored_lp)
+                    stored_raw, actual_draws, min_ess, max_rhat, stored_lp
+                )
                 logger.info(
                     f"PTDE convergence @ {actual_draws} draws: "
-                    f"max_rhat={rhat_val:.4f}  min_ess={ess_val:.1f}")
+                    f"max_rhat={rhat_val:.4f}  min_ess={ess_val:.1f}"
+                )
+                # GUI progress hook: fires at each geometric check, so overhead
+                # stays bounded. Passes the live T=1 draw buffers by reference
+                # so a snapshot writer can downsample them itself.
+                _safe_progress(
+                    progress_callback,
+                    {
+                        "n_draws": actual_draws,
+                        "n_chains": n_chains,
+                        "max_rhat": rhat_val,
+                        "min_ess": ess_val,
+                        "elapsed_s": time.time() - start_time,
+                        "stop_reason": "converged" if converged else None,
+                        "stored_raw": stored_raw,
+                        "stored_lp": stored_lp,
+                        "raw_var_names": model_keys,
+                    },
+                )
                 _next_check[0] = next(_check_gen, None)
                 if converged:
                     logger.info("PTDE: convergence criterion met, wrapping up")
@@ -1092,39 +1332,50 @@ def ptde_sample(
     finally:
         signal.signal(signal.SIGINT, old_sigint)
         signal.signal(signal.SIGTERM, old_sigterm)
+        if old_sigbreak is not None:
+            signal.signal(signal.SIGBREAK, old_sigbreak)
         if pool is not None:
             pool.close()
             pool.join()
 
     # convert raw → physical for every stored draw
     if actual_draws == 0:
-        raise RuntimeError("PTDE: sampling stopped during tune — no draws were collected")
+        raise RuntimeError(
+            "PTDE: sampling stopped during tune — no draws were collected"
+        )
     if actual_draws < draws:
-        logger.info(f"PTDE: early stop — {actual_draws}/{draws} draws collected")
+        logger.info(
+            f"PTDE: early stop — {actual_draws}/{draws} draws collected"
+        )
 
     logger.info(
-        f"PTDE: converting {n_chains} × {actual_draws} draws to physical space…")
+        f"PTDE: converting {n_chains} × {actual_draws} draws to physical space…"
+    )
 
     # Flatten (n_chains, draws) -> (n_total,) per raw variable and run the
     # batched converter in chunks (bounds memory for large n_params/draws;
     # chunk_size is independent of param count/shape, only of sample count).
     n_total = n_chains * actual_draws
-    flat_raw = {k: stored_raw[k][:, :actual_draws].reshape(
-                    (n_total,) + raw_start[k].shape)
-                for k in raw_var_names}
+    flat_raw = {
+        k: stored_raw[k][:, :actual_draws].reshape(
+            (n_total,) + raw_start[k].shape
+        )
+        for k in raw_var_names
+    }
     chunk_size = 20000
     out_chunks = {name: [] for name in out_var_names}
     for start in range(0, n_total, chunk_size):
         end = min(start + chunk_size, n_total)
         chunk_out = raw_to_phys_batched(
-            *[flat_raw[k][start:end] for k in raw_var_names])
+            *[flat_raw[k][start:end] for k in raw_var_names]
+        )
         for name, val in zip(out_var_names, chunk_out):
             out_chunks[name].append(np.asarray(val, dtype=float))
 
     # assemble posterior dict: (n_chains, draws, ...) per variable
     posterior_dict = {}
     for name in out_var_names:
-        arr = np.concatenate(out_chunks[name], axis=0)   # (n_total, ...)
+        arr = np.concatenate(out_chunks[name], axis=0)  # (n_total, ...)
         arr = arr.reshape((n_chains, actual_draws) + arr.shape[1:])
         # old per-sample path ran every value through atleast_1d then squeezed
         # a trailing dim-1 for scalar params -- match that convention here.
@@ -1132,10 +1383,12 @@ def ptde_sample(
             arr = arr.squeeze(-1)
         posterior_dict[name] = arr
 
-    idata = az.from_dict({
-        "posterior": posterior_dict,
-        "sample_stats": {"lp": stored_lp[:, :actual_draws]},
-    })
+    idata = az.from_dict(
+        {
+            "posterior": posterior_dict,
+            "sample_stats": {"lp": stored_lp[:, :actual_draws]},
+        }
+    )
 
     # Multi-seed provenance (P4): record which solved seed each T=1 chain was
     # started from.  With seeded starts, occupancy weights are initialization
@@ -1145,18 +1398,28 @@ def ptde_sample(
     # attribution is wired; for now the per-chain attr is the source of truth.
     idata.posterior.attrs["chain_seed_index"] = list(chain_seed_index)
     if len(set(chain_seed_index)) > 1:
-        logger.info(f"PTDE multi-seed provenance (chain -> seed): {list(chain_seed_index)}")
+        logger.info(
+            f"PTDE multi-seed provenance (chain -> seed): {list(chain_seed_index)}"
+        )
 
     ar_T1 = float(n_accept[0] / max(n_propose[0], 1))
     sr_all = n_swap_accept / np.maximum(n_swap_propose, 1)
     rt_rate = round_trips[0] / max(n_swap_rounds, 1)
     logger.info(
         f"PTDE done: {actual_draws}/{draws} draws  accept(T=1)={ar_T1:.3f}  "
-        + (f"swap=[{', '.join(f'{r:.2f}' for r in sr_all)}]  "
-           f"round_trips={round_trips[0]} (rate={rt_rate:.3f}/round, "
-           f"schedule={swap_schedule})"
-           if n_temps > 1 else "")
-        + (f"  eval_timeouts={n_eval_timeouts[0]}" if n_eval_timeouts[0] else ""))
+        + (
+            f"swap=[{', '.join(f'{r:.2f}' for r in sr_all)}]  "
+            f"round_trips={round_trips[0]} (rate={rt_rate:.3f}/round, "
+            f"schedule={swap_schedule})"
+            if n_temps > 1
+            else ""
+        )
+        + (
+            f"  eval_timeouts={n_eval_timeouts[0]}"
+            if n_eval_timeouts[0]
+            else ""
+        )
+    )
 
     if collect_rung_timing:
         logger.info("PTDE per-rung logp timing (seconds):")
@@ -1171,6 +1434,7 @@ def ptde_sample(
                 f"  rung {k} (T={temperatures[k]:.1f}): n={len(arr)}  "
                 f"median={np.median(arr):.3f}  mean={arr.mean():.3f}  "
                 f"p90={np.percentile(arr, 90):.3f}  max={arr.max():.3f}  "
-                f"n_slow(>0.1s)={n_slow}")
+                f"n_slow(>0.1s)={n_slow}"
+            )
 
     return idata
